@@ -1,0 +1,22 @@
+# Secrets — never commit these
+.env
+.env.*
+*.env
+!.env.example
+*.pem
+*.key
+service-account*.json
+sa.json
+
+# Dependencies
+node_modules/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

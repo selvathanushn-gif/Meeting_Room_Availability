@@ -1,0 +1,17 @@
+{
+  "name": "rooms-bot",
+  "version": "1.0.0",
+  "description": "Slack /rooms slash command showing available Google Calendar rooms",
+  "main": "server.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "googleapis": "^176.0.0"
+  }
+}
