@@ -302,4 +302,30 @@ app.post("/slack/rooms", async (req, res) => {
 
 app.get("/health", (_req, res) => res.send("ok"));
 
-app.listen(PORT, () => console.log(`rooms-bot listening on :${PORT}`));
+// ---------------------------------------------------------------------------
+// Keep-alive: on Render's free tier the service spins down after ~15 min idle,
+// and the cold start (30-60s) blows past Slack's 3s limit. Pinging our own
+// /health endpoint on an interval keeps the instance awake while it's running.
+// Render injects RENDER_EXTERNAL_URL for web services; SELF_URL lets you
+// override (e.g. a custom domain). No URL -> no ping (e.g. local dev).
+// ---------------------------------------------------------------------------
+function startKeepAlive() {
+  const base = process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL;
+  if (!base) return;
+  const url = `${base.replace(/\/$/, "")}/health`;
+  const EVERY_MS = 10 * 60 * 1000; // 10 min, safely under the 15-min idle window
+  const timer = setInterval(async () => {
+    try {
+      await fetch(url);
+    } catch (err) {
+      console.error("keep-alive ping failed:", err.message);
+    }
+  }, EVERY_MS);
+  timer.unref();
+  console.log(`keep-alive pinging ${url} every ${EVERY_MS / 60000} min`);
+}
+
+app.listen(PORT, () => {
+  console.log(`rooms-bot listening on :${PORT}`);
+  startKeepAlive();
+});
