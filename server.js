@@ -31,9 +31,9 @@ const {
 // buildingId comes from the Admin console / Admin SDK resources.buildings.list.
 // Add one entry per office. The keys are what users type.
 const OFFICES = {
-  london: { buildingId: "Staging-Kanto", label: "Kanto" },
-  nyc: { buildingId: "Staging-Bucharest", label: "Bucharest" },
-  sf: { buildingId: "Staging-Seoul", label: "Seoul" },
+  kanto: { buildingId: "Staging-Kanto", label: "Kanto" },
+  bucharest: { buildingId: "Staging-Bucharest", label: "Bucharest" },
+  seoul: { buildingId: "Staging-Seoul", label: "Seoul" },
 };
 
 // Rooms to hide from /rooms results, by resource email (exact match).
