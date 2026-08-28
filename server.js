@@ -2,13 +2,6 @@
  * /rooms — a Slack slash command that lists currently-available meeting rooms
  * for a given office, using Google Calendar room resources.
  *
- * Flow:
- *   1. Slack POSTs the slash command here.
- *   2. We verify the Slack signature and ACK within 3 seconds.
- *   3. Asynchronously we: list room resources (Admin SDK, cached),
- *      run freebusy.query in batches of 50, keep rooms with no busy block now,
- *      and post the result back to Slack via response_url.
- *
  * Requires Node 18+ (uses global fetch).
  */
 
@@ -27,9 +20,8 @@ const {
   PORT = 3000,
 } = process.env;
 
-// Map the keyword a user types (`/rooms london`) to a Google buildingId.
-// buildingId comes from the Admin console / Admin SDK resources.buildings.list.
-// Add one entry per office. The keys are what users type.
+// Map the keyword a user types (`/rooms kanto`) to a Google buildingId.
+// The keys are what users type; also populate the dropdown automatically.
 const OFFICES = {
   kanto: { buildingId: "Staging-Kanto", label: "Kanto" },
   bucharest: { buildingId: "Staging-Bucharest", label: "Bucharest" },
@@ -37,16 +29,12 @@ const OFFICES = {
 };
 
 // Rooms to hide from /rooms results, by resource email (exact match).
-// Use this for exec/boardrooms, phone booths, or team-reserved spaces you
-// don't want surfaced to everyone. Get the emails from the Admin console
-// (Buildings and resources) or from a one-off run of listRooms().
 const EXCLUDED_ROOM_EMAILS = new Set([
   "c_188es4u2tu9ashnfg642hts7e18s0@resource.calendar.google.com",
   // "c_188...@resource.calendar.google.com",
 ]);
 
-// Optional: also hide any room whose name matches one of these patterns
-// (case-insensitive). Handy when hidden rooms share a naming convention.
+// Optional: also hide any room whose name matches one of these patterns.
 const EXCLUDED_NAME_PATTERNS = [
   // /phone booth/i,
   // /^EXEC /i,
@@ -58,13 +46,10 @@ function isHidden(r) {
   return EXCLUDED_NAME_PATTERNS.some((re) => re.test(name));
 }
 
-// How far ahead we read each room's calendar (minutes). Larger gives better
-// "free until" info; keep it comfortably above MIN_FREE_MINUTES.
+// How far ahead we read each room's calendar (minutes).
 const LOOKAHEAD_MIN = 120;
 
 // A room must be free for at least this many minutes from now to be shown.
-// This is the buffer that hides rooms which are free this instant but about
-// to be booked. Bump to 30 if you want more runway; drop to 5 for a looser list.
 const MIN_FREE_MINUTES = 15;
 
 // Google's freebusy.query resolves at most 50 calendars per request.
@@ -105,7 +90,7 @@ async function listRooms(auth) {
       pageToken,
     });
     for (const r of res.data.items || []) {
-      if (r.resourceCategory !== "CONFERENCE_ROOM") continue; // skip desks, equipment, etc.
+      if (r.resourceCategory !== "CONFERENCE_ROOM") continue; // skip desks, equipment
       if (isHidden(r)) continue; // skip rooms we don't want surfaced
       rooms.push({
         email: r.resourceEmail,
@@ -125,9 +110,6 @@ async function listRooms(auth) {
 // ---------------------------------------------------------------------------
 // Availability check via freebusy.query (batched)
 // ---------------------------------------------------------------------------
-// Minutes a room is free starting now, given its busy blocks.
-// Returns 0 if occupied right now, or Infinity if nothing is booked
-// within the lookahead window.
 function freeMinutesFrom(nowMs, busy) {
   let nextStart = Infinity;
   for (const b of busy) {
@@ -160,12 +142,10 @@ async function findAvailable(auth, rooms) {
       const info = cals[r.email];
       if (!info || info.errors) continue; // unreadable -> treat as unavailable
       const freeMin = freeMinutesFrom(now.getTime(), info.busy || []);
-      // Only show rooms with enough runway before their next booking.
       if (freeMin >= MIN_FREE_MINUTES) results.push({ ...r, freeMin });
     }
   }
 
-  // Right-size first (smaller rooms first); tiebreak by most free time.
   return results.sort(
     (a, b) => (a.capacity || 0) - (b.capacity || 0) || b.freeMin - a.freeMin
   );
@@ -214,19 +194,67 @@ function buildBlocks(officeLabel, freeRooms) {
     },
     {
       type: "context",
-      elements: [
-        { type: "mrkdwn", text: `Checked ${new Date().toLocaleTimeString()}` },
-      ],
+      elements: [{ type: "mrkdwn", text: `Checked ${new Date().toLocaleTimeString()}` }],
     },
   ];
 }
 
-async function postToSlack(responseUrl, blocks) {
+async function postToSlack(responseUrl, blocks, replaceOriginal = false) {
   await fetch(responseUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ response_type: "ephemeral", blocks }),
+    body: JSON.stringify({
+      response_type: "ephemeral",
+      replace_original: replaceOriginal,
+      blocks,
+    }),
   });
+}
+
+// A select-menu message shown when someone runs `/rooms` with no office.
+function buildOfficePicker() {
+  const options = Object.entries(OFFICES).map(([key, o]) => ({
+    text: { type: "plain_text", text: o.label },
+    value: key,
+  }));
+  return [
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: "Which office? Pick one to see what's free right now:" },
+      accessory: {
+        type: "static_select",
+        action_id: "pick_office",
+        placeholder: { type: "plain_text", text: "Choose an office" },
+        options,
+      },
+    },
+  ];
+}
+
+// Shared worker: look up an office's free rooms and post them back to Slack.
+async function sendRoomsFor(officeKey, responseUrl, replaceOriginal = false) {
+  const office = OFFICES[officeKey];
+  if (!office) return;
+  try {
+    const auth = getAuth();
+    await auth.authorize();
+    const all = await listRooms(auth);
+    const inOffice = all.filter((r) => r.buildingId === office.buildingId);
+    const free = await findAvailable(auth, inOffice);
+    await postToSlack(responseUrl, buildBlocks(office.label, free), replaceOriginal);
+  } catch (err) {
+    console.error(err);
+    await postToSlack(
+      responseUrl,
+      [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text: ":warning: Couldn't check rooms right now. Try again shortly." },
+        },
+      ],
+      replaceOriginal
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +289,7 @@ app.use(
   })
 );
 
+// Slash command: /rooms  or  /rooms <office>
 app.post("/slack/rooms", async (req, res) => {
   if (!verifySlack(req)) return res.status(401).send("bad signature");
 
@@ -268,46 +297,52 @@ app.post("/slack/rooms", async (req, res) => {
   const responseUrl = req.body.response_url;
   const office = OFFICES[text];
 
-  // No/unknown office -> ACK immediately with a helpful prompt.
+  // No/unknown office -> show a dropdown to pick one.
   if (!office) {
-    const options = Object.keys(OFFICES).join(", ");
-    return res.json({
-      response_type: "ephemeral",
-      text: `Which office? Try \`/rooms <office>\`. Options: ${options}`,
-    });
+    return res.json({ response_type: "ephemeral", blocks: buildOfficePicker() });
   }
 
   // ACK within 3s, then do the slow work and post via response_url.
   res.json({ response_type: "ephemeral", text: `:mag: Checking rooms in ${office.label}…` });
+  sendRoomsFor(text, responseUrl);
+});
 
+// Handles the dropdown selection (Slack Interactivity).
+app.post("/slack/interactivity", async (req, res) => {
+  if (!verifySlack(req)) return res.status(401).send("bad signature");
+
+  let payload;
+  try {
+    payload = JSON.parse(req.body.payload);
+  } catch {
+    return res.status(400).send("bad payload");
+  }
+
+  // Ack immediately so Slack doesn't time out.
+  res.status(200).send("");
+
+  const action = (payload.actions || [])[0];
+  const responseUrl = payload.response_url;
+  if (!action || action.action_id !== "pick_office" || !action.selected_option) return;
+
+  const officeKey = action.selected_option.value;
+  const office = OFFICES[officeKey];
   (async () => {
-    try {
-      const auth = getAuth();
-      await auth.authorize();
-      const all = await listRooms(auth);
-      const inOffice = all.filter((r) => r.buildingId === office.buildingId);
-      const free = await findAvailable(auth, inOffice);
-      await postToSlack(responseUrl, buildBlocks(office.label, free));
-    } catch (err) {
-      console.error(err);
-      await postToSlack(responseUrl, [
-        {
-          type: "section",
-          text: { type: "mrkdwn", text: ":warning: Couldn't check rooms right now. Try again shortly." },
-        },
-      ]);
-    }
+    // Replace the menu with a "checking" note, then with the results.
+    await postToSlack(
+      responseUrl,
+      [{ type: "section", text: { type: "mrkdwn", text: `:mag: Checking rooms in ${office ? office.label : officeKey}…` } }],
+      true
+    );
+    await sendRoomsFor(officeKey, responseUrl, true);
   })();
 });
 
 app.get("/health", (_req, res) => res.send("ok"));
 
 // ---------------------------------------------------------------------------
-// Keep-alive: on Render's free tier the service spins down after ~15 min idle,
-// and the cold start (30-60s) blows past Slack's 3s limit. Pinging our own
-// /health endpoint on an interval keeps the instance awake while it's running.
-// Render injects RENDER_EXTERNAL_URL for web services; SELF_URL lets you
-// override (e.g. a custom domain). No URL -> no ping (e.g. local dev).
+// Keep-alive: on Render's free tier the service spins down after ~15 min idle.
+// Pinging our own /health endpoint keeps the instance awake while it's running.
 // ---------------------------------------------------------------------------
 function startKeepAlive() {
   const base = process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL;
