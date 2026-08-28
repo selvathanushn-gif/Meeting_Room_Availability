@@ -1,6 +1,11 @@
 /**
  * /rooms — a Slack slash command that lists currently-available meeting rooms
- * for a given office, using Google Calendar room resources.
+ * for a given office and party size, using Google Calendar room resources.
+ *
+ * Flow:
+ *   /rooms                  -> office dropdown -> size dropdown -> results
+ *   /rooms <office>         -> size dropdown -> results
+ *   /rooms <office> <size>  -> results directly
  *
  * Requires Node 18+ (uses global fetch).
  */
@@ -21,12 +26,15 @@ const {
 } = process.env;
 
 // Map the keyword a user types (`/rooms kanto`) to a Google buildingId.
-// The keys are what users type; also populate the dropdown automatically.
+// The keys are what users type; they also populate the office dropdown.
 const OFFICES = {
   kanto: { buildingId: "Staging-Kanto", label: "Kanto" },
   bucharest: { buildingId: "Staging-Bucharest", label: "Bucharest" },
   seoul: { buildingId: "Staging-Seoul", label: "Seoul" },
 };
+
+// Party-size options offered in the dropdown (2..10 in twos).
+const SIZES = [2, 4, 6, 8, 10];
 
 // Rooms to hide from /rooms results, by resource email (exact match).
 const EXCLUDED_ROOM_EMAILS = new Set([
@@ -145,10 +153,24 @@ async function findAvailable(auth, rooms) {
       if (freeMin >= MIN_FREE_MINUTES) results.push({ ...r, freeMin });
     }
   }
+  return results;
+}
 
-  return results.sort(
-    (a, b) => (a.capacity || 0) - (b.capacity || 0) || b.freeMin - a.freeMin
-  );
+// Order rooms by how well they fit `target` people:
+//   1) rooms that seat >= target, closest fit first (least wasted seats)
+//   2) rooms too small, largest first (nearest alternative)
+//   3) rooms with unknown capacity, last
+function rankByCapacity(rooms, target) {
+  const rank = (cap) => {
+    if (cap == null) return [2, 0];
+    if (cap >= target) return [0, cap - target];
+    return [1, target - cap];
+  };
+  return [...rooms].sort((a, b) => {
+    const [ga, da] = rank(a.capacity);
+    const [gb, db] = rank(b.capacity);
+    return ga - gb || da - db || (a.capacity || 0) - (b.capacity || 0);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -164,14 +186,15 @@ function fmtFree(freeMin) {
   return `free ~${freeMin} min`;
 }
 
-function buildBlocks(officeLabel, freeRooms) {
+function buildBlocks(officeLabel, freeRooms, targetSize = null) {
+  const forWhom = targetSize ? ` for ~${targetSize} people` : "";
   if (!freeRooms.length) {
     return [
       {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `:no_entry: No rooms free for at least ${MIN_FREE_MINUTES} min in *${officeLabel}*.`,
+          text: `:no_entry: No rooms free for at least ${MIN_FREE_MINUTES} min in *${officeLabel}*${forWhom}.`,
         },
       },
     ];
@@ -180,8 +203,11 @@ function buildBlocks(officeLabel, freeRooms) {
     .map((r) => {
       const bits = [fmtFree(r.freeMin)];
       if (r.floor) bits.push(`floor ${r.floor}`);
-      if (r.capacity) bits.push(`${r.capacity} seats`);
-      return `:white_check_mark: *${r.name}*  _(${bits.join(", ")})_`;
+      bits.push(r.capacity ? `${r.capacity} seats` : "capacity n/a");
+      // Flag rooms that are smaller than the requested party size.
+      const tooSmall = targetSize && r.capacity != null && r.capacity < targetSize;
+      const marker = tooSmall ? ":warning:" : ":white_check_mark:";
+      return `${marker} *${r.name}*  _(${bits.join(", ")})_`;
     })
     .join("\n");
   return [
@@ -189,7 +215,7 @@ function buildBlocks(officeLabel, freeRooms) {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `*Rooms free now in ${officeLabel}* (≥${MIN_FREE_MINUTES} min runway):\n${lines}`,
+        text: `*Rooms free now in ${officeLabel}${forWhom}* (≥${MIN_FREE_MINUTES} min runway):\n${lines}`,
       },
     },
     {
@@ -211,7 +237,7 @@ async function postToSlack(responseUrl, blocks, replaceOriginal = false) {
   });
 }
 
-// A select-menu message shown when someone runs `/rooms` with no office.
+// Dropdown 1: pick an office. Shown when /rooms is run with no office.
 function buildOfficePicker() {
   const options = Object.entries(OFFICES).map(([key, o]) => ({
     text: { type: "plain_text", text: o.label },
@@ -231,8 +257,30 @@ function buildOfficePicker() {
   ];
 }
 
-// Shared worker: look up an office's free rooms and post them back to Slack.
-async function sendRoomsFor(officeKey, responseUrl, replaceOriginal = false) {
+// Dropdown 2: pick a party size. The office is encoded in each option value
+// ("kanto:6") so the next interaction knows both office and size.
+function buildSizePicker(officeKey) {
+  const label = OFFICES[officeKey] ? OFFICES[officeKey].label : officeKey;
+  const options = SIZES.map((n) => ({
+    text: { type: "plain_text", text: `${n} people` },
+    value: `${officeKey}:${n}`,
+  }));
+  return [
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: `*${label}* — how many people is the room for?` },
+      accessory: {
+        type: "static_select",
+        action_id: "pick_size",
+        placeholder: { type: "plain_text", text: "Party size" },
+        options,
+      },
+    },
+  ];
+}
+
+// Shared worker: find an office's free rooms, rank by fit, post back to Slack.
+async function sendRoomsFor(officeKey, responseUrl, replaceOriginal = false, targetSize = null) {
   const office = OFFICES[officeKey];
   if (!office) return;
   try {
@@ -240,8 +288,9 @@ async function sendRoomsFor(officeKey, responseUrl, replaceOriginal = false) {
     await auth.authorize();
     const all = await listRooms(auth);
     const inOffice = all.filter((r) => r.buildingId === office.buildingId);
-    const free = await findAvailable(auth, inOffice);
-    await postToSlack(responseUrl, buildBlocks(office.label, free), replaceOriginal);
+    let free = await findAvailable(auth, inOffice);
+    free = targetSize ? rankByCapacity(free, targetSize) : free.sort((a, b) => (a.capacity || 0) - (b.capacity || 0));
+    await postToSlack(responseUrl, buildBlocks(office.label, free, targetSize), replaceOriginal);
   } catch (err) {
     console.error(err);
     await postToSlack(
@@ -289,25 +338,35 @@ app.use(
   })
 );
 
-// Slash command: /rooms  or  /rooms <office>
+// Slash command: /rooms [office] [size]
 app.post("/slack/rooms", async (req, res) => {
   if (!verifySlack(req)) return res.status(401).send("bad signature");
 
-  const text = (req.body.text || "").trim().toLowerCase();
+  const parts = (req.body.text || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const officeKey = parts[0];
+  const sizeArg = parts[1] ? parseInt(parts[1], 10) : null;
   const responseUrl = req.body.response_url;
-  const office = OFFICES[text];
+  const office = OFFICES[officeKey];
 
-  // No/unknown office -> show a dropdown to pick one.
+  // No/unknown office -> office dropdown.
   if (!office) {
     return res.json({ response_type: "ephemeral", blocks: buildOfficePicker() });
   }
 
-  // ACK within 3s, then do the slow work and post via response_url.
-  res.json({ response_type: "ephemeral", text: `:mag: Checking rooms in ${office.label}…` });
-  sendRoomsFor(text, responseUrl);
+  // Office but no valid size -> size dropdown.
+  if (!SIZES.includes(sizeArg)) {
+    return res.json({ response_type: "ephemeral", blocks: buildSizePicker(officeKey) });
+  }
+
+  // Office + size -> results.
+  res.json({
+    response_type: "ephemeral",
+    text: `:mag: Checking rooms in ${office.label} for ~${sizeArg} people…`,
+  });
+  sendRoomsFor(officeKey, responseUrl, false, sizeArg);
 });
 
-// Handles the dropdown selection (Slack Interactivity).
+// Handles both dropdown selections (Slack Interactivity).
 app.post("/slack/interactivity", async (req, res) => {
   if (!verifySlack(req)) return res.status(401).send("bad signature");
 
@@ -323,19 +382,45 @@ app.post("/slack/interactivity", async (req, res) => {
 
   const action = (payload.actions || [])[0];
   const responseUrl = payload.response_url;
-  if (!action || action.action_id !== "pick_office" || !action.selected_option) return;
+  if (!action || !action.selected_option) return;
 
-  const officeKey = action.selected_option.value;
-  const office = OFFICES[officeKey];
-  (async () => {
-    // Replace the menu with a "checking" note, then with the results.
+  try {
+    // Office chosen -> replace office menu with the size menu.
+    if (action.action_id === "pick_office") {
+      const officeKey = action.selected_option.value;
+      await postToSlack(responseUrl, buildSizePicker(officeKey), true);
+      return;
+    }
+
+    // Size chosen -> value is "officeKey:size". Show results.
+    if (action.action_id === "pick_size") {
+      const [officeKey, sizeStr] = action.selected_option.value.split(":");
+      const size = parseInt(sizeStr, 10);
+      const office = OFFICES[officeKey];
+      await postToSlack(
+        responseUrl,
+        [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `:mag: Checking rooms in ${office ? office.label : officeKey} for ~${size} people…`,
+            },
+          },
+        ],
+        true
+      );
+      await sendRoomsFor(officeKey, responseUrl, true, size);
+      return;
+    }
+  } catch (err) {
+    console.error(err);
     await postToSlack(
       responseUrl,
-      [{ type: "section", text: { type: "mrkdwn", text: `:mag: Checking rooms in ${office ? office.label : officeKey}…` } }],
+      [{ type: "section", text: { type: "mrkdwn", text: ":warning: Something went wrong. Try again." } }],
       true
     );
-    await sendRoomsFor(officeKey, responseUrl, true);
-  })();
+  }
 });
 
 app.get("/health", (_req, res) => res.send("ok"));
