@@ -41,7 +41,7 @@ const OFFICES = {
 // don't want surfaced to everyone. Get the emails from the Admin console
 // (Buildings and resources) or from a one-off run of listRooms().
 const EXCLUDED_ROOM_EMAILS = new Set([
-  // "exec-boardroom@resource.calendar.google.com",
+  "c_188es4u2tu9ashnfg642hts7e18s0@resource.calendar.google.com",
   // "c_188...@resource.calendar.google.com",
 ]);
 
